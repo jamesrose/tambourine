@@ -1,15 +1,19 @@
 package tambourine
 
 import (
+	"encoding/json"
+
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/sns"
 	"github.com/aws/aws-sdk-go/service/sqs"
+	"github.com/aws/aws-sdk-go/service/sts"
 )
 
 type SNSSQSAdapter struct {
 	SQSConn *sqs.SQS
 	SNSConn *sns.SNS
+	STSConn *sts.STS
 	Config  SNSSQSConfig
 }
 
@@ -18,25 +22,53 @@ type SNSSQSConfig struct {
 	QueueNamePrefix string
 }
 
+type Policy struct {
+	Version   string
+	ID        string `json:"Id"`
+	Statement Statement
+}
+
+type Statement struct {
+	Sid       string
+	Effect    string
+	Principal string
+	Action    string
+	Resource  string
+	Condition Condition
+}
+
+type Condition struct {
+	ArnEquals ArnEquals
+}
+
+type ArnEquals struct {
+	SourceArn string `json:"aws:SourceArn"`
+}
+
 func NewSNSSQSAdapter(config SNSSQSConfig) SNSSQSAdapter {
 	session := session.New()
 	cfg := &aws.Config{Region: aws.String(config.Region)}
 	return SNSSQSAdapter{
 		SQSConn: sqs.New(session, cfg),
 		SNSConn: sns.New(session, cfg),
+		STSConn: sts.New(session, cfg),
 		Config:  config,
 	}
 }
 
+func (adapter SNSSQSAdapter) QueueNamePrefix() string {
+	return adapter.Config.QueueNamePrefix
+}
+
 func (adapter SNSSQSAdapter) publish(queue Queue, message Message) error {
-	name := queue.PrefixedName(adapter.Config.QueueNamePrefix)
-	q, err := adapter.createPublishQueue(name)
+	name := queue.PrefixedName(adapter.QueueNamePrefix())
+	pubQueue, err := adapter.createPublishQueue(name)
 	if err != nil {
 		return err
 	}
 	input := &sns.PublishInput{
 		Message:  aws.String(message.Body),
-		TopicArn: q.TopicArn,
+		TopicArn: pubQueue.TopicArn,
 	}
 
 	_, err = adapter.SNSConn.Publish(input)
@@ -57,20 +89,86 @@ func (adapter SNSSQSAdapter) createConsumeQueue(name string) (*sqs.CreateQueueOu
 }
 
 func (adapter SNSSQSAdapter) consume(queue Queue, worker string) ([]Message, error) {
-	name := queue.PrefixedNameAndWorker(adapter.Config.QueueNamePrefix, worker)
+	name := queue.PrefixedNameAndWorker(adapter.QueueNamePrefix(), worker)
 
-	q, err := adapter.createConsumeQueue(name)
+	// Create consumer queue
+	conQueue, err := adapter.createConsumeQueue(name)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get consumer queue attributes
+	attrInput := &sqs.GetQueueAttributesInput{
+		QueueUrl: conQueue.QueueUrl,
+		AttributeNames: []*string{
+			aws.String(sqs.QueueAttributeNameQueueArn),
+		},
+	}
+	conQueueAttr, err := adapter.SQSConn.GetQueueAttributes(attrInput)
+	if err != nil {
+		return nil, err
+	}
+	conQueueARN := conQueueAttr.Attributes[sqs.QueueAttributeNameQueueArn]
+
+	// Subscribe
+	pubName := queue.PrefixedName(adapter.QueueNamePrefix())
+	pubQueue, err := adapter.createPublishQueue(pubName)
+	if err != nil {
+		return nil, err
+	}
+	subReq := &sns.SubscribeInput{
+		TopicArn: pubQueue.TopicArn,
+		Protocol: aws.String("sqs"),
+		Endpoint: conQueueARN,
+	}
+	_, err = adapter.SNSConn.Subscribe(subReq)
+	if err != nil {
+		return nil, err
+	}
+
+	policy := Policy{
+		ID:      name,
+		Version: "2008-10-17",
+		Statement: Statement{
+			Sid:       "SendMessage",
+			Effect:    "Allow",
+			Principal: "*",
+			Action:    "SQS:SendMessage",
+			Resource:  *conQueueARN,
+			Condition: Condition{
+				ArnEquals: ArnEquals{
+					SourceArn: *pubQueue.TopicArn,
+				},
+			},
+		},
+	}
+
+	policyJSON, err := json.Marshal(policy)
+	if err != nil {
+		return nil, err
+	}
+
+	// Add permission
+	setAttrInput := &sqs.SetQueueAttributesInput{
+		QueueUrl: conQueue.QueueUrl,
+		Attributes: map[string]*string{
+			sqs.QueueAttributeNamePolicy: aws.String(string(policyJSON)),
+		},
+	}
+
+	_, err = adapter.SQSConn.SetQueueAttributes(setAttrInput)
 	if err != nil {
 		return nil, err
 	}
 
 	rmi := &sqs.ReceiveMessageInput{
-		QueueUrl: q.QueueUrl,
+		QueueUrl: conQueue.QueueUrl,
 	}
 	msgs, err := adapter.SQSConn.ReceiveMessage(rmi)
 	if err != nil {
 		return nil, err
 	}
+
 	messages := make([]Message, len(msgs.Messages))
 	for i, m := range msgs.Messages {
 		messages[i] = Message{Body: *m.Body}
