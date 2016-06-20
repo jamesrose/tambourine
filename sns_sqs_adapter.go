@@ -155,12 +155,12 @@ func (adapter SNSSQSAdapter) consume(queue Queue, worker string) ([]Message, err
 			sqs.QueueAttributeNamePolicy: aws.String(string(policyJSON)),
 		},
 	}
-
 	_, err = adapter.SQSConn.SetQueueAttributes(setAttrInput)
 	if err != nil {
 		return nil, err
 	}
 
+	// Receive message
 	rmi := &sqs.ReceiveMessageInput{
 		QueueUrl: conQueue.QueueUrl,
 	}
@@ -169,9 +169,13 @@ func (adapter SNSSQSAdapter) consume(queue Queue, worker string) ([]Message, err
 		return nil, err
 	}
 
+	var message Message
 	messages := make([]Message, len(msgs.Messages))
 	for i, m := range msgs.Messages {
-		messages[i] = Message{Body: *m.Body}
+		if err := json.Unmarshal([]byte(*m.Body), &message); err != nil {
+			return nil, err
+		}
+		messages[i] = message
 	}
 	return messages, nil
 }

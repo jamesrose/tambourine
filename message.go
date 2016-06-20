@@ -1,5 +1,5 @@
 package tambourine
 
 type Message struct {
-	Body string
+	Body string `json:"Message"`
 }
